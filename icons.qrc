@@ -1,0 +1,8 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icons">
+    <file alias="picture">icons/picture.png</file>
+    <file alias="reload">icons/reload.png</file>
+    <file alias="stellarstore">icons/stellarstore.png</file>
+  </qresource>
+</RCC>

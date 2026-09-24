@@ -1,0 +1,9 @@
+=== (1) ¿EXISTE el binario? ===
+ls: não foi possível acessar '/home/gus/Downloads/Proyect/Store/build/LightStore': Arquivo ou diretório inexistente
+
+=== (2) ¿Existen todos los fuentes en disco? ===
+31
+
+=== (3) Contenido real del CMakeLists.txt (primera línea + target) ===
+cmake_minimum_required(VERSION 3.16)
+add_executable(LightStore ${APP_SOURCES}
