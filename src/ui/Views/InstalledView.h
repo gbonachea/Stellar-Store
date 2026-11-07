@@ -1,6 +1,7 @@
 #pragma once
 
-#include <QStringList>
+#include <QList>
+#include <QShowEvent>
 #include <QWidget>
 
 #include <memory>
@@ -8,8 +9,8 @@
 #include "core/AppStreamManager.h"
 
 /**
- * "Instaladas" screen: one card per currently installed package, each with
- * an action to remove it through the matching backend.
+ * "Instaladas" screen: one card per currently installed application, each with
+ * an action to remove it through the backend that actually owns it.
  */
 class InstalledView final : public QWidget
 {
@@ -21,11 +22,14 @@ public:
     Q_DISABLE_COPY_MOVE(InstalledView)
 
 public slots:
-    void setInstalledPackages(const QStringList &packages);
+    void setInstalledApps(const QList<AppInfo> &apps);
 
 signals:
     void openRequested(const AppInfo &info);
-    void removeRequested(const QString &packageId);
+    void removeRequested(const AppInfo &info);
+
+protected:
+    void showEvent(QShowEvent *event) override;
 
 private:
     void rebuild();

@@ -233,13 +233,13 @@ AppDetailDialog::AppDetailDialog(const AppInfo &info, QWidget *parent)
         : tr("Esta aplicación no publica un paquete nativo en los "
              "repositorios; usa Flatpak o Snap."));
 
-    const bool flatpakOk = flatpakOn && ConfigManager::instance()->flatpakEnabled();
+    const bool flatpakOk = !info.flatpakId.isEmpty() && flatpakOn && ConfigManager::instance()->flatpakEnabled();
     d->flatpakRadio->setEnabled(flatpakOk);
     d->flatpakRadio->setToolTip(flatpakOk
         ? QString()
         : tr("Flatpak no está disponible o está deshabilitado en Ajustes."));
 
-    const bool snapOk = snapOn && ConfigManager::instance()->snapEnabled();
+    const bool snapOk = !info.snapId.isEmpty() && snapOn && ConfigManager::instance()->snapEnabled();
     d->snapRadio->setEnabled(snapOk);
     d->snapRadio->setToolTip(snapOk
         ? QString()
@@ -254,10 +254,16 @@ AppDetailDialog::AppDetailDialog(const AppInfo &info, QWidget *parent)
 
     d->installButton = new QPushButton(tr("Instalar"), this);
     d->installButton->setDefault(true);
-    d->installButton->setEnabled(nativeOn || flatpakOk || snapOk);
+    d->installButton->setEnabled(nativeOn || flatpakOk || snapOk
+                                 || info.origin == QLatin1String("github"));
 
     d->removeButton = new QPushButton(tr("Desinstalar"), this);
     d->removeButton->setStyleSheet(QStringLiteral("color:#d96a6a;"));
+
+    // GitHub releases have their own download flow; the native/Flatpak/Snap
+    // picker does not apply to them.
+    if (info.origin == QLatin1String("github"))
+        backendBox->setVisible(false);
 
     if (d->info.installed) {
         d->installButton->setText(tr("Abrir"));
@@ -276,17 +282,13 @@ AppDetailDialog::AppDetailDialog(const AppInfo &info, QWidget *parent)
     root->addLayout(actionLayout);
 
     auto pickBackend = [this] {
-        QString backend = QStringLiteral("native");
+        if (d->info.origin == QLatin1String("github"))
+            return QStringLiteral("github");
         if (d->flatpakRadio->isChecked())
-            backend = QStringLiteral("flatpak");
-        else if (d->snapRadio->isChecked())
-            backend = QStringLiteral("snap");
-
-        QString target = d->info.id;
-        if (backend == QLatin1String("native")
-            && !d->info.packageNames.isEmpty())
-            target = d->info.packageNames.first();
-        return qMakePair(target, backend);
+            return QStringLiteral("flatpak");
+        if (d->snapRadio->isChecked())
+            return QStringLiteral("snap");
+        return QStringLiteral("native");
     };
 
     connect(d->installButton, &QPushButton::clicked, this, [this, pickBackend] {
@@ -295,8 +297,7 @@ AppDetailDialog::AppDetailDialog(const AppInfo &info, QWidget *parent)
             close();
             return;
         }
-        const auto [target, backend] = pickBackend();
-        emit installRequested(target, backend);
+        emit installRequested(d->info, pickBackend());
         close();
     });
 

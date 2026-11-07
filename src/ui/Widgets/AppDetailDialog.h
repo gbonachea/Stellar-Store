@@ -23,7 +23,7 @@ public:
     Q_DISABLE_COPY_MOVE(AppDetailDialog)
 
 signals:
-    void installRequested(const QString &appId, const QString &backend);
+    void installRequested(const AppInfo &info, const QString &backend);
     void openRequested(const AppInfo &info);
     void removeRequested(const AppInfo &info);
 

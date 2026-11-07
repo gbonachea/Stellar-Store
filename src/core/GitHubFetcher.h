@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QList>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
@@ -47,14 +48,26 @@ public:
         QUrl url;
         QUrl direct;         // browser_download_url (redirect-safe)
         qint64 sizeBytes = 0;
+        QString releaseTag;  // e.g. "v1.2.3"
+        QString releaseName; // human-readable release title
+        QString releaseNotes;
+        QString ownerAvatar;
     };
 
     void fetchLatestReleases();
+
+    /**
+     * Pick the asset that best fits this machine (native package format
+     * first, AppImage as fallback, foreign architectures excluded).
+     */
+    static Asset preferredAsset(const QList<Asset> &assets);
+
     void downloadAsset(const Asset &asset);
     void downloadToFile(const Asset &asset, const QString &destinationPath);
     bool busy() const;
 
 signals:
+    void fetchStarted();
     void assetDiscovered(const GitHubFetcher::Asset &asset);
     void downloadProgress(const QString &repo, const QString &fileName,
                           qint64 bytesReceived, qint64 bytesTotal);

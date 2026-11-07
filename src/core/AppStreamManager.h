@@ -33,6 +33,13 @@ struct AppInfo
     /** Native package name(s) this component maps to (may be empty). */
     QStringList packageNames;
 
+    /** Confirmed bundle identifiers from AppStream metadata. */
+    QString flatpakId;
+    QString snapId;
+
+    /** Project website from AppStream, used to identify matching sources. */
+    QString homepage;
+
     /** Origin indicator: "system", "user", "flatpak", "snap" or "github". */
     QString origin;
 
@@ -60,6 +67,9 @@ struct AppInfo
 
     /** True when this is an ordinary desktop/console application. */
     bool isApplication = true;
+
+    /** Absolute path of the launcher that starts this app (may be empty). */
+    QString desktopFile;
 
     /** For GitHub-origin apps: the "owner/name" repository. */
     QString repository;
@@ -113,14 +123,7 @@ public slots:
     void startLoading();
 
     /** Force a cache refresh, then reload. */
-    void requestCacheRefresh();
-
-    /**
-     * Asynchronously load one AppStream pool ("system" or user scope).
-     * @param systemPool true to load /usr/share/metainfo, false to load the
-     *                   per-user pool (~/.local/share/appstream).
-     */
-    void loadPoolAsync(bool systemPool);
+    void requestCacheRefresh(bool includeSystemIndex = true);
 
 signals:
     /** Emitted when system applications finished loading. */
@@ -139,9 +142,20 @@ signals:
     void loadFailed(const QString &message);
 
 private:
-    /** Run "appstreamcli refresh --source=os" and report on @ref
-     *  refreshCacheSucceeded / @ref refreshCacheFailed. */
-    void runCacheRefresh();
+    /**
+     * Run the refresh steps (optional system package index, Flatpak appstream,
+     * AppStream OS cache) in sequence and report on
+     * @ref refreshCacheSucceeded / @ref refreshCacheFailed.
+     */
+    void runCacheRefresh(bool includeSystemIndex);
+    void runNextRefreshStep();
+
+    /**
+     * Load the system and the per-user pools sequentially on one worker
+     * thread. libappstream is not safe for concurrent pool loads, so both
+     * scopes must be read one after the other.
+     */
+    void loadAllPools();
 
     class Private;
     std::unique_ptr<Private> d;

@@ -207,12 +207,15 @@ void AbstractBackend::startProcess(const QString &program,
                          .arg(exitCode);
             d->lastProgress = 100;
             emit progressChanged(100);
-            emit operationFinished(ok, message, d->lastCommand);
+            // Deliver the fresh list *before* operationFinished: callers that
+            // annotate the catalog from the operationFinished handler need the
+            // updated package list to already be in place.
             if (ok && d->listCallback) {
                 const auto callback = d->listCallback;
                 d->listCallback = {};
                 callback(normalizePackageList(d->listBuffer));
             }
+            emit operationFinished(ok, message, d->lastCommand);
         });
     }
 

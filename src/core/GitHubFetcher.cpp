@@ -13,6 +13,7 @@
 #include <QJsonValue>
 #include <QDir>
 #include <QDirIterator>
+#include <QSysInfo>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QUrl>
@@ -28,7 +29,9 @@ const auto kUserAgent        = QStringLiteral("StellarStore/1.0 (+https://exampl
 
 QString stagingDirectory()
 {
-    return QStringLiteral("/tmp/lightstore");
+    const QString dir = QStringLiteral("/tmp/lightstore");
+    QDir().mkpath(dir);
+    return dir;
 }
 
 QString binDirectory()
@@ -62,6 +65,83 @@ QString choiceForFileName(const QString &fileName)
     return QString();
 }
 
+bool isForeignArchitecture(const QString &fileName)
+{
+    const QString cpu = QSysInfo::currentCpuArchitecture().toLower();
+    const QString lower = fileName.toLower();
+
+    const bool isX86 = cpu.contains(QLatin1String("x86"))
+                       || cpu.contains(QLatin1String("amd64"));
+    if (isX86) {
+        return lower.contains(QLatin1String("aarch64"))
+            || lower.contains(QLatin1String("arm64"))
+            || lower.contains(QLatin1String("armhf"))
+            || lower.contains(QLatin1String("armv7"))
+            || lower.contains(QLatin1String("arm"))
+            || lower.contains(QLatin1String("riscv"));
+    }
+    if (cpu.contains(QLatin1String("arm"))
+        || cpu.contains(QLatin1String("aarch64"))) {
+        return lower.contains(QLatin1String("amd64"))
+            || lower.contains(QLatin1String("x86_64"))
+            || lower.contains(QLatin1String("i386"))
+            || lower.contains(QLatin1String("i686"));
+    }
+    return false;
+}
+
+int assetScore(const QString &fileName)
+{
+    const QString lower = fileName.toLower();
+    int score = 0;
+
+    const bool isDeb = lower.endsWith(kDebSuffix);
+    const bool isRpm = lower.endsWith(kRpmSuffix);
+    const bool isAppImage = lower.endsWith(kAppImageSuffix.toLower());
+
+    // Prefer the format the local native package manager understands.
+    if (QFileInfo::exists(QStringLiteral("/usr/bin/apt-get"))) {
+        if (isDeb)
+            score += 100;
+        else if (isAppImage)
+            score += 20;
+        else if (isRpm)
+            score += 10;
+    } else if (QFileInfo::exists(QStringLiteral("/usr/bin/dnf"))
+               || QFileInfo::exists(QStringLiteral("/usr/bin/pacman"))) {
+        if (isRpm)
+            score += 100;
+        else if (isAppImage)
+            score += 20;
+        else if (isDeb)
+            score += 10;
+    } else {
+        if (isAppImage)
+            score += 100;
+        else if (isDeb || isRpm)
+            score += 10;
+    }
+
+    if (lower.contains(QLatin1String("amd64"))
+        || lower.contains(QLatin1String("x86_64")))
+        score += 30;
+    if (isForeignArchitecture(lower))
+        score -= 200;
+
+    // Never select signatures, debug symbols or checksum side-cars.
+    static const QStringList noise = {
+        QStringLiteral("sha256"), QStringLiteral("sha512"),
+        QStringLiteral("checksum"), QStringLiteral("debug"),
+        QStringLiteral("symbols"), QStringLiteral("source"),
+    };
+    for (const QString &word : noise) {
+        if (lower.contains(word))
+            score -= 100;
+    }
+
+    return score;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -73,6 +153,7 @@ public:
     QHash<QString, int> activeReplies;          // repo -> in-flight reply count
     int totalFetches = 0;                       // scalar counter
     int completed = 0;
+    bool refetchPending = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -93,10 +174,20 @@ GitHubFetcher::~GitHubFetcher()
 
 void GitHubFetcher::fetchLatestReleases()
 {
+    // Ignore overlapping refreshes: the in-flight request already covers
+    // every configured repository, but remember that another pass was asked
+    // for so newly added repositories are not lost.
+    if (busy()) {
+        d->refetchPending = true;
+        return;
+    }
+
     const QStringList repos = ConfigManager::instance()->githubRepositories();
     d->activeReplies.clear();
     d->totalFetches = repos.size();
     d->completed = 0;
+
+    emit fetchStarted();
 
     if (repos.isEmpty()) {
         emit allFetchesFinished();
@@ -107,6 +198,24 @@ void GitHubFetcher::fetchLatestReleases()
         processRepo(repo, false);
 }
 
+GitHubFetcher::Asset GitHubFetcher::preferredAsset(const QList<Asset> &assets)
+{
+    if (assets.isEmpty())
+        return Asset();
+
+    Asset best = assets.constFirst();
+    int bestScore = assetScore(best.fileName);
+    for (int i = 1; i < assets.size(); ++i) {
+        const Asset &candidate = assets.at(i);
+        const int score = assetScore(candidate.fileName);
+        if (score > bestScore) {
+            best = candidate;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
 void GitHubFetcher::processRepo(const QString &repoToken, bool isSingle)
 {
     if (repoToken.isEmpty())
@@ -114,9 +223,8 @@ void GitHubFetcher::processRepo(const QString &repoToken, bool isSingle)
 
     const QStringList parts = repoToken.split(QStringLiteral("/"));
     if (parts.size() != 2 || parts.at(0).isEmpty() || parts.at(1).isEmpty()) {
-        if (!isSingle)
-            --d->activeReplies[repoToken];
         emit errorOccurred(QStringLiteral("Invalid repository token: %1").arg(repoToken));
+        finishFetch(isSingle);
         return;
     }
 
@@ -149,6 +257,12 @@ void GitHubFetcher::processRepo(const QString &repoToken, bool isSingle)
 
         const QJsonObject root = doc.object();
         const QJsonArray assets = root.value(QStringLiteral("assets")).toArray();
+        const QString releaseTag = root.value(QStringLiteral("tag_name")).toString();
+        const QString releaseName = root.value(QStringLiteral("name")).toString();
+        const QString releaseNotes = root.value(QStringLiteral("body")).toString();
+        const QString ownerAvatar =
+            root.value(QStringLiteral("owner")).toObject()
+                .value(QStringLiteral("avatar_url")).toString();
 
         for (const QJsonValue &v : assets) {
             const QJsonObject asset = v.toObject();
@@ -158,6 +272,10 @@ void GitHubFetcher::processRepo(const QString &repoToken, bool isSingle)
             a.url = QUrl(asset.value(QStringLiteral("url")).toString());
             a.direct = QUrl(asset.value(QStringLiteral("browser_download_url")).toString());
             a.sizeBytes = asset.value(QStringLiteral("size")).toVariant().toLongLong();
+            a.releaseTag = releaseTag;
+            a.releaseName = releaseName;
+            a.releaseNotes = releaseNotes;
+            a.ownerAvatar = ownerAvatar;
 
             if (!a.fileName.isEmpty() && isSupportedSuffix(a.fileName))
                 emit assetDiscovered(a);
@@ -173,8 +291,15 @@ void GitHubFetcher::finishFetch(bool isSingle)
 
     ++d->completed;
     const bool done = (d->completed >= d->totalFetches) || (isSingle && d->totalFetches == 1);
-    if (done)
-        emit allFetchesFinished();
+    if (!done)
+        return;
+
+    emit allFetchesFinished();
+
+    if (d->refetchPending) {
+        d->refetchPending = false;
+        fetchLatestReleases();
+    }
 }
 
 void GitHubFetcher::downloadAsset(const Asset &asset)
@@ -236,7 +361,7 @@ void GitHubFetcher::postDownload(const Asset &asset, const QString &localPath)
                           QFile::permissions(localPath) | QFileDevice::ExeUser);
 
     // Create a .desktop launcher so it shows up in the system menus.
-    const QString appId = fi.baseName();
+    const QString appId = fi.completeBaseName();
     QFile desktop(desktopDirectory() + QStringLiteral("/%1.desktop").arg(appId));
     if (desktop.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         QTextStream out(&desktop);

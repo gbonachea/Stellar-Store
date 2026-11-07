@@ -12,7 +12,26 @@ struct DesktopEntry
     QString iconPath;
     QString exec;
     QStringList categories;
+    bool hidden = false;
+    bool noDisplay = false;
 };
+
+/**
+ * Directories that may contain application launchers, in priority order
+ * (user entries first, then Flatpak/Snap exports, then the system paths).
+ */
+QStringList desktopApplicationDirectories();
+
+/**
+ * All visible .desktop launchers installed on the system, deduplicated by
+ * desktop id. User entries win over system entries with the same id.
+ */
+QStringList installedDesktopFiles();
+
+/**
+ * "flatpak", "snap", "user" or "system" depending on where @p path lives.
+ */
+QString desktopEntryOrigin(const QString &path);
 
 /** Absolute path of the .desktop matching @p appId, or empty. */
 QString findDesktopFile(const QString &appId);

@@ -19,12 +19,15 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+#include <algorithm>
+
 #include "backends/AbstractBackend.h"
 #include "backends/FlatpakBackend.h"
 #include "backends/NativeBackend.h"
 #include "backends/SnapBackend.h"
 #include "core/AppStreamManager.h"
 #include "core/ConfigManager.h"
+#include "core/DesktopEntry.h"
 #include "core/GitHubFetcher.h"
 #include "ui/Views/AboutView.h"
 #include "ui/Views/CatalogView.h"
@@ -68,6 +71,7 @@ public:
     QHash<QString, QList<GitHubFetcher::Asset>> githubAssets;
     QSet<QString> pendingGithubRepos;
 
+    QList<AppInfo> appstreamApps;
     QList<AppInfo> masterApps;
     QSet<QString> installedIds;
     QSet<QString> nativeIds;
@@ -241,12 +245,24 @@ MainWindow::MainWindow(QWidget *parent)
     // Id we can hand to the Flatpak backend for install (Flatpak refuses ids
     // with fewer than two dots).
     auto flatpakTarget = [baseName](const AppInfo &info) {
+        if (!info.flatpakId.isEmpty())
+            return info.flatpakId;
         if (info.id.count(QLatin1Char('.')) >= 2)
             return info.id;
         return baseName(info.id);
     };
 
     auto annotate = [this, baseName, matchesFlatpakId] {
+        // Installed package names do not always match the component id (the
+        // distro may ship a differently named package). Presence of the real
+        // launcher is the most reliable "is installed" signal for desktop
+        // components, so build a lookup of installed desktop ids.
+        QSet<QString> desktopIds;
+        const QStringList launchers = installedDesktopFiles();
+        desktopIds.reserve(launchers.size());
+        for (const QString &path : launchers)
+            desktopIds.insert(QFileInfo(path).completeBaseName().toLower());
+
         QList<AppInfo> annotated = d->masterApps;
         for (AppInfo &app : annotated) {
             app.installed = false;
@@ -258,8 +274,115 @@ MainWindow::MainWindow(QWidget *parent)
             }
             if (!app.installed && !matchesFlatpakId(app.id, d->installedIds).isEmpty())
                 app.installed = true;
+            if (!app.installed && desktopIds.contains(baseName(app.id).toLower()))
+                app.installed = true;
         }
         return annotated;
+    };
+
+    // Compose the catalog from AppStream metadata plus the GitHub releases.
+    // Keeping both lists separate lets each source refresh independently
+    // without losing the entries provided by the other one.
+    auto rebuildMaster = [this] {
+        QList<AppInfo> combined = d->appstreamApps;
+        QSet<QString> ids;
+        ids.reserve(combined.size() + d->githubApps.size());
+        for (const AppInfo &app : std::as_const(combined))
+            ids.insert(app.id);
+        for (const AppInfo &app : std::as_const(d->githubApps)) {
+            if (ids.contains(app.id))
+                continue;
+            ids.insert(app.id);
+            combined.append(app);
+        }
+        d->masterApps = combined;
+    };
+
+    // Build the "Instaladas" list from real .desktop launchers, not from an
+    // exact package-name match. This is what makes Flatpak/Snap/AppImage and
+    // components whose package owns a differently named launcher visible.
+    auto rebuildInstalled = [this](const QList<AppInfo> &annotated) {
+        QList<AppInfo> entries;
+        QSet<QString> seen;
+        seen.reserve(annotated.size() + 256);
+
+        auto desktopKey = [](const QString &path) {
+            return QFileInfo(path).completeBaseName().toLower();
+        };
+
+        for (const AppInfo &app : annotated) {
+            if (!app.installed)
+                continue;
+
+            QString desktopFile = findDesktopFile(app.id);
+            if (desktopFile.isEmpty()) {
+                for (const QString &pkg : app.packageNames) {
+                    desktopFile = findDesktopFile(pkg);
+                    if (!desktopFile.isEmpty())
+                        break;
+                }
+            }
+
+            AppInfo entry = app;
+            QString key = app.id.toLower();
+            if (!desktopFile.isEmpty()) {
+                DesktopEntry de;
+                if (parseDesktopEntry(desktopFile, de)) {
+                    entry.id = de.id;
+                    if (entry.name.isEmpty() || entry.name == app.id)
+                        entry.name = de.name;
+                    if (entry.summary.isEmpty())
+                        entry.summary = de.summary;
+                    if (entry.iconPath.isEmpty() && !de.iconPath.isEmpty())
+                        entry.iconPath = de.iconPath;
+                    if (entry.iconName.isEmpty() && !de.iconName.isEmpty())
+                        entry.iconName = de.iconName;
+                    if (entry.categories.isEmpty())
+                        entry.categories = de.categories;
+                }
+                entry.desktopFile = desktopFile;
+                entry.origin = desktopEntryOrigin(desktopFile);
+                key = desktopKey(desktopFile);
+            }
+
+            if (key.isEmpty() || seen.contains(key))
+                continue;
+            seen.insert(key);
+            entry.installed = true;
+            entries.append(entry);
+        }
+
+        // Launchers that do not map to any AppStream component still count as
+        // installed applications (AppImages, locally built tools, etc.).
+        for (const QString &desktopFile : installedDesktopFiles()) {
+            const QString key = desktopKey(desktopFile);
+            if (key.isEmpty() || seen.contains(key))
+                continue;
+
+            DesktopEntry de;
+            if (!parseDesktopEntry(desktopFile, de))
+                continue;
+
+            AppInfo info;
+            info.id = de.id;
+            info.name = de.name;
+            info.summary = de.summary.isEmpty() ? tr("Instalado") : de.summary;
+            info.categories = de.categories;
+            info.iconName = de.iconName;
+            info.iconPath = de.iconPath;
+            info.desktopFile = desktopFile;
+            info.origin = desktopEntryOrigin(desktopFile);
+            info.installed = true;
+
+            seen.insert(key);
+            entries.append(info);
+        }
+
+        std::sort(entries.begin(), entries.end(),
+                  [](const AppInfo &a, const AppInfo &b) {
+                      return a.name.localeAwareCompare(b.name) < 0;
+                  });
+        d->installed->setInstalledApps(entries);
     };
 
     // Cheap path used after backend refreshes: flip the buttons of the already
@@ -267,12 +390,13 @@ MainWindow::MainWindow(QWidget *parent)
     // widgets otherwise block the GUI and balloon memory on every action).
     // CatalogView stores the fresh, annotated list; it only rebuilds its
     // (bounded) visible chunk if the page was already opened.
-    auto applyAnnotations = [this, annotate] {
+    auto applyAnnotations = [this, annotate, rebuildInstalled] {
         if (!d->structureBuilt)
             return;
         const QList<AppInfo> annotated = annotate();
         d->home->updateInstalledFlags(annotated);
         d->catalog->setApps(annotated);
+        rebuildInstalled(annotated);
     };
 
     auto absorbInstalled = [this] {
@@ -299,25 +423,36 @@ MainWindow::MainWindow(QWidget *parent)
         }
     };
 
+    connect(d->settings, &SettingsView::backendSettingsChanged, this,
+            [this, refreshInstalledStatus] {
+                refreshInstalledStatus();
+                d->stream->startLoading();
+            });
+
     auto openInstalledApp = [this](const AppInfo &info) {
         QString base = info.id;
         if (base.endsWith(QLatin1String(".desktop")))
             base.chop(int(QStringLiteral(".desktop").size()));
 
-        const QString candidate = base + QLatin1String(".desktop");
-        for (const QString &dir :
-             {QStringLiteral("/usr/share/applications"),
-              QStringLiteral("/usr/local/share/applications"),
-              QDir::homePath()
-                  + QStringLiteral("/.local/share/applications")}) {
-            const QString path = QDir(dir).filePath(candidate);
-            if (QFileInfo::exists(path)) {
-                if (QProcess::startDetached(
-                        QStringLiteral("gio"),
-                        QStringList() << QStringLiteral("launch") << path))
-                    return;
+        QString desktopFile = info.desktopFile;
+        if (desktopFile.isEmpty())
+            desktopFile = findDesktopFile(info.id);
+        if (desktopFile.isEmpty()) {
+            for (const QString &pkg : info.packageNames) {
+                desktopFile = findDesktopFile(pkg);
+                if (!desktopFile.isEmpty())
+                    break;
             }
         }
+        if (desktopFile.isEmpty())
+            desktopFile = findDesktopFile(base);
+
+        if (!desktopFile.isEmpty()
+            && QProcess::startDetached(
+                QStringLiteral("gio"),
+                QStringList() << QStringLiteral("launch") << desktopFile))
+            return;
+
         if (QProcess::startDetached(QStringLiteral("gtk-launch"),
                                     QStringList() << base))
             return;
@@ -329,11 +464,15 @@ MainWindow::MainWindow(QWidget *parent)
 
     // ------------------------------------------------- metadata wiring
     connect(d->stream, &AppStreamManager::dataReady,
-            this, [this, annotate](const QList<AppInfo> &apps) {
-                d->masterApps = apps;
-                d->home->showApps(annotate());
-                d->catalog->setApps(annotate());
+            this, [this, annotate, rebuildMaster, rebuildInstalled](
+                      const QList<AppInfo> &apps) {
+                d->appstreamApps = apps;
+                rebuildMaster();
+                const QList<AppInfo> annotated = annotate();
+                d->home->showApps(annotated);
+                d->catalog->setApps(annotated);
                 d->structureBuilt = true;
+                rebuildInstalled(annotated);
                 d->busyIndicator->setVisible(false);
             });
     connect(d->stream, &AppStreamManager::refreshStarted,
@@ -342,6 +481,11 @@ MainWindow::MainWindow(QWidget *parent)
             d->procDialog, &ProcessDialog::setStatusMessage);
     connect(d->stream, &AppStreamManager::loadFailed,
             this, [this] { d->busyIndicator->setVisible(false); });
+    connect(d->stream, &AppStreamManager::refreshCacheFailed, this, [this] {
+        d->procDialog->setStatusMessage(
+            tr("No se pudo actualizar el índice de repositorios."));
+        d->busyIndicator->setVisible(false);
+    });
 
     connect(d->refreshButton, &QPushButton::clicked, this,
             [this, refreshInstalledStatus] {
@@ -351,33 +495,126 @@ MainWindow::MainWindow(QWidget *parent)
             });
 
     // -------------------------------------------------- github wiring
+    auto downloadGithubAsset = [this](const QString &repo) {
+        const auto assets = d->githubAssets.value(repo);
+        if (assets.isEmpty())
+            return false;
+
+        const GitHubFetcher::Asset asset =
+            GitHubFetcher::preferredAsset(assets);
+        d->procDialog->setStatusMessage(
+            tr("Descargando %1…").arg(asset.fileName));
+        d->github->downloadAsset(asset);
+        return true;
+    };
+
+    connect(d->github, &GitHubFetcher::fetchStarted, this, [this] {
+        // A new pass replaces the previous snapshot; otherwise repeated
+        // refreshes would accumulate duplicate cards.
+        d->githubApps.clear();
+        d->githubAssets.clear();
+        d->home->setGithubApps(d->githubApps);
+    });
+
     connect(d->github, &GitHubFetcher::assetDiscovered, this,
             [this](const GitHubFetcher::Asset &asset) {
                 d->githubAssets[asset.repo].append(asset);
-
-                AppInfo info;
-                info.id = asset.repo;
-                info.name = asset.fileName;
-                info.summary = QStringLiteral("Novedad de GitHub — %1")
-                                   .arg(asset.repo);
-                info.origin = QStringLiteral("github");
-                info.repository = asset.repo;
-                d->githubApps.append(info);
-
-                if (d->pendingGithubRepos.remove(asset.repo))
-                    d->github->downloadAsset(asset);
             });
-    connect(d->github, &GitHubFetcher::allFetchesFinished, this, [this] {
-        d->home->setGithubApps(d->githubApps);
-    });
+
+    connect(d->github, &GitHubFetcher::allFetchesFinished, this,
+            [this, rebuildMaster, applyAnnotations, downloadGithubAsset] {
+                d->githubApps.clear();
+
+                QStringList repos = d->githubAssets.keys();
+                std::sort(repos.begin(), repos.end());
+
+                for (const QString &repo : repos) {
+                    const auto assets = d->githubAssets.value(repo);
+                    if (assets.isEmpty())
+                        continue;
+
+                    const GitHubFetcher::Asset asset =
+                        GitHubFetcher::preferredAsset(assets);
+
+                    AppInfo info;
+                    info.id = QStringLiteral("github:") + repo;
+                    info.name = asset.releaseName.trimmed();
+                    if (info.name.isEmpty()
+                        || info.name == asset.releaseTag)
+                        info.name = repo;
+                    info.summary = asset.releaseTag.isEmpty()
+                        ? tr("Última versión de %1").arg(repo)
+                        : tr("%1 — %2").arg(repo, asset.releaseTag);
+                    info.description = asset.releaseNotes;
+                    info.categories = QStringList() << QStringLiteral("Utility");
+                    info.origin = QStringLiteral("github");
+                    info.repository = repo;
+                    info.releaseTag = asset.releaseTag;
+                    info.iconUrl = asset.ownerAvatar;
+                    d->githubApps.append(info);
+
+                    if (d->pendingGithubRepos.remove(repo))
+                        downloadGithubAsset(repo);
+                }
+
+                if (!d->pendingGithubRepos.isEmpty()) {
+                    QStringList pending = d->pendingGithubRepos.values();
+                    pending.sort();
+                    d->procDialog->setStatusMessage(
+                        tr("No se encontraron binarios compatibles en: %1")
+                            .arg(pending.join(QStringLiteral(", "))));
+                    d->pendingGithubRepos.clear();
+                }
+
+                rebuildMaster();
+                d->home->setGithubApps(d->githubApps);
+
+                // The catalog already exists: fold the GitHub apps in and
+                // re-apply installed flags without waiting for AppStream.
+                applyAnnotations();
+            });
+
+    connect(d->github, &GitHubFetcher::errorOccurred, this,
+            [this](const QString &message) {
+                d->procDialog->setStatusMessage(message);
+                if (!d->pendingGithubRepos.isEmpty()) {
+                    d->procDialog->show();
+                    d->procDialog->raise();
+                }
+            });
+
     connect(d->github, &GitHubFetcher::downloadFinished, this,
-            [this](const QString &repo, const QString &fileName,
-                   const QString &localPath, bool ok) {
-                d->procDialog->setStatusMessage(
-                    ok ? tr("Descargado: %1/%2 → %3").arg(repo, fileName, localPath)
-                       : tr("Error descargando: %1").arg(fileName));
+            [this, refreshInstalledStatus](const QString &repo,
+                                           const QString &fileName,
+                                           const QString &localPath, bool ok) {
+                if (!ok) {
+                    d->procDialog->setStatusMessage(
+                        tr("Error descargando %1/%2").arg(repo, fileName));
+                    d->procDialog->show();
+                    return;
+                }
+
+                const QString lower = localPath.toLower();
+                if ((lower.endsWith(QLatin1String(".deb"))
+                     || lower.endsWith(QLatin1String(".rpm")))
+                    && d->native->isAvailable()) {
+                    d->procDialog->setStatusMessage(
+                        tr("Instalando %1…").arg(fileName));
+                    d->native->installLocalFile(localPath);
+                } else {
+                    d->procDialog->setStatusMessage(
+                        tr("Descargado: %1/%2 → %3")
+                            .arg(repo, fileName, localPath));
+                    // AppImages get a fresh .desktop launcher, so the
+                    // installed list has to be rebuilt.
+                    refreshInstalledStatus();
+                }
                 d->procDialog->show();
             });
+
+    connect(ConfigManager::instance(),
+            &ConfigManager::githubRepositoriesChanged,
+            this, [this] { d->github->fetchLatestReleases(); });
 
     // --------------------------------------------------- search wiring
     connect(d->search, &QLineEdit::textChanged,
@@ -402,17 +639,13 @@ MainWindow::MainWindow(QWidget *parent)
     // Route one app to the backend selected on its card ("native",
     // "flatpak", "snap", "github"); an empty backend falls back to the
     // best available option.
-auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget](
+auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget,
+                   downloadGithubAsset](
                       const AppInfo &info, const QString &backend) {
         showProcess();
 
         if (backend == QLatin1String("github")) {
-            const auto assets = d->githubAssets.value(info.repository);
-            if (!assets.isEmpty()) {
-                d->procDialog->setStatusMessage(
-                    tr("Descargando %1…").arg(assets.constFirst().fileName));
-                d->github->downloadAsset(assets.constFirst());
-            } else {
+            if (!downloadGithubAsset(info.repository)) {
                 d->procDialog->setStatusMessage(
                     tr("Buscando la versión de %1 en GitHub…")
                         .arg(info.repository));
@@ -432,7 +665,7 @@ auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget](
         }
         if (backend == QLatin1String("flatpak")
             || backend.isEmpty()) {
-            if (flatpakReady()) {
+            if (flatpakReady() && !info.flatpakId.isEmpty()) {
                 const QString fid = flatpakTarget(info);
                 d->procDialog->setStatusMessage(
                     tr("Instalando %1 vía Flatpak…").arg(fid));
@@ -442,20 +675,15 @@ auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget](
         }
         if (backend == QLatin1String("snap")
             || backend.isEmpty()) {
-            if (snapReady()) {
+            if (snapReady() && !info.snapId.isEmpty()) {
                 d->procDialog->setStatusMessage(
-                    tr("Instalando %1 vía Snap…").arg(info.id));
-                d->snap->installPackage(info.id);
+                    tr("Instalando %1 vía Snap…").arg(info.snapId));
+                d->snap->installPackage(info.snapId);
                 return;
             }
         }
         if (backend.isEmpty() && info.origin == QLatin1String("github")) {
-            const auto assets = d->githubAssets.value(info.repository);
-            if (!assets.isEmpty()) {
-                d->procDialog->setStatusMessage(
-                    tr("Descargando %1…").arg(assets.constFirst().fileName));
-                d->github->downloadAsset(assets.constFirst());
-            } else {
+            if (!downloadGithubAsset(info.repository)) {
                 d->procDialog->setStatusMessage(
                     tr("Buscando la versión de %1 en GitHub…")
                         .arg(info.repository));
@@ -477,8 +705,21 @@ auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget](
                       matchesFlatpakId](const AppInfo &info) {
         showProcess();
         const QString base = baseName(info.id);
-        const QString nativePkg =
+        QString nativePkg =
             info.packageNames.isEmpty() ? base : info.packageNames.first();
+
+        // AppStream components do not always publish PackageName. Ask the
+        // package manager which package owns the launcher instead of giving
+        // up on removal.
+        if (!d->nativeIds.contains(nativePkg)
+            && !info.desktopFile.isEmpty()
+            && d->native->isAvailable()) {
+            const QString owner =
+                d->native->packageOwningFile(info.desktopFile);
+            if (!owner.isEmpty() && d->nativeIds.contains(owner))
+                nativePkg = owner;
+        }
+
         if (d->nativeIds.contains(nativePkg) && d->native->isAvailable()) {
             d->procDialog->setStatusMessage(tr("Desinstalando %1…").arg(nativePkg));
             d->native->removePackage(nativePkg);
@@ -491,10 +732,26 @@ auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget](
             d->flatpak->removePackage(fid);
             return;
         }
-        if (d->snapIds.contains(base) && snapReady()) {
+        if (info.origin == QLatin1String("flatpak") && flatpakReady()) {
+            const QString target = base.isEmpty() ? info.id : base;
             d->procDialog->setStatusMessage(
-                tr("Desinstalando %1 vía Snap…").arg(base));
-            d->snap->removePackage(base);
+                tr("Desinstalando %1 vía Flatpak…").arg(target));
+            d->flatpak->removePackage(target);
+            return;
+        }
+
+        QString snapName = base;
+        if (snapName.contains(QLatin1Char('_')))
+            snapName = snapName.section(QLatin1Char('_'), 0, 0);
+        if (snapName.startsWith(QLatin1String("snap.")))
+            snapName = snapName.mid(5).section(QLatin1Char('.'), 0, 0);
+
+        if ((d->snapIds.contains(snapName)
+             || info.origin == QLatin1String("snap"))
+            && snapReady()) {
+            d->procDialog->setStatusMessage(
+                tr("Desinstalando %1 vía Snap…").arg(snapName));
+            d->snap->removePackage(snapName);
             return;
         }
         d->procDialog->setStatusMessage(
@@ -504,26 +761,15 @@ auto installApp = [this, showProcess, flatpakReady, snapReady, flatpakTarget](
     };
 
     // ------------------------------------------------ detail dialog
-    auto openDetail = [this, showProcess, openInstalledApp, removeApp, baseName](
+    auto openDetail = [this, showProcess, openInstalledApp, removeApp, installApp](
                       const AppInfo &info) {
         auto *dialog = new AppDetailDialog(info, this);
         dialog->setAttribute(Qt::WA_DeleteOnClose);
 connect(dialog, &AppDetailDialog::installRequested, this,
-            [this, dialog, showProcess, baseName](const QString &appId,
-                                                   const QString &backend) {
+            [this, dialog, showProcess, installApp](const AppInfo &app,
+                                                    const QString &backend) {
                 showProcess();
-                QString target = appId;
-                if (backend == QLatin1String("flatpak")
-                    && target.count(QLatin1Char('.')) < 2)
-                    target = baseName(target);
-                d->procDialog->setStatusMessage(
-                    tr("Instalando %1 (backend %2)…").arg(target, backend));
-                if (backend == QLatin1String("flatpak"))
-                    d->flatpak->installPackage(target);
-                else if (backend == QLatin1String("snap"))
-                    d->snap->installPackage(target);
-                else
-                    d->native->installPackage(target);
+                installApp(app, backend);
                 dialog->close();
             });
 connect(dialog, &AppDetailDialog::removeRequested, this,
@@ -555,11 +801,7 @@ connect(dialog, &AppDetailDialog::removeRequested, this,
     connect(d->catalog, &CatalogView::removeRequested, this,
             [removeApp](const AppInfo &info) { removeApp(info); });
     connect(d->installed, &InstalledView::removeRequested, this,
-            [this, showProcess](const QString &packageId) {
-                showProcess();
-                d->procDialog->setStatusMessage(tr("Desinstalando %1…").arg(packageId));
-                d->native->removePackage(packageId);
-            });
+            [removeApp](const AppInfo &info) { removeApp(info); });
     connect(d->local, &LocalInstallerView::installRequested, this,
             [this, showProcess](const QString &filePath) {
                 showProcess();
@@ -616,29 +858,34 @@ connect(dialog, &AppDetailDialog::removeRequested, this,
 
     // ------------------------------------------------ installed status
     connect(d->native, &AbstractBackend::packagesRefreshed, this,
-            [this, absorbInstalled](const QStringList &packages) {
+            [this, absorbInstalled, applyAnnotations](
+                const QStringList &packages) {
                 d->nativeIds.clear();
                 d->nativeIds.reserve(packages.size());
                 for (const QString &p : packages)
                     d->nativeIds.insert(p);
-                d->installed->setInstalledPackages(packages);
                 absorbInstalled();
+                applyAnnotations();
             });
     connect(d->flatpak, &AbstractBackend::packagesRefreshed, this,
-            [this, absorbInstalled](const QStringList &packages) {
+            [this, absorbInstalled, applyAnnotations](
+                const QStringList &packages) {
                 d->flatpakIds.clear();
                 d->flatpakIds.reserve(packages.size());
                 for (const QString &p : packages)
                     d->flatpakIds.insert(p);
                 absorbInstalled();
+                applyAnnotations();
             });
     connect(d->snap, &AbstractBackend::packagesRefreshed, this,
-            [this, absorbInstalled](const QStringList &packages) {
+            [this, absorbInstalled, applyAnnotations](
+                const QStringList &packages) {
                 d->snapIds.clear();
                 d->snapIds.reserve(packages.size());
                 for (const QString &p : packages)
                     d->snapIds.insert(p);
                 absorbInstalled();
+                applyAnnotations();
             });
 
     // ------------------------------------------------------- bootstrap

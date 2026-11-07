@@ -149,12 +149,14 @@ void AppCardWidget::setAppInfo(const AppInfo &info)
             anyBackend = true;
         }
         auto *cfg = ConfigManager::instance();
-        if (QFileInfo::exists(QStringLiteral("/usr/bin/flatpak"))
+        if (!info.flatpakId.isEmpty()
+            && QFileInfo::exists(QStringLiteral("/usr/bin/flatpak"))
             && cfg->flatpakEnabled()) {
             d->backendCombo->addItem(tr("Flatpak"), QStringLiteral("flatpak"));
             anyBackend = true;
         }
-        if (QFileInfo::exists(QStringLiteral("/usr/bin/snap"))
+        if (!info.snapId.isEmpty()
+            && QFileInfo::exists(QStringLiteral("/usr/bin/snap"))
             && cfg->snapEnabled()) {
             d->backendCombo->addItem(tr("Snap"), QStringLiteral("snap"));
             anyBackend = true;
@@ -180,7 +182,7 @@ void AppCardWidget::setAppInfo(const AppInfo &info)
         d->removeButton->setEnabled(true);
     } else {
         d->installButton->setText(tr("Instalar"));
-        d->installButton->setEnabled(AbstractBackend::managesInstall());
+        d->installButton->setEnabled(d->anyBackend);
         d->removeButton->setEnabled(false);
     }
 }
@@ -198,7 +200,7 @@ void AppCardWidget::setInstalled(bool installed)
         d->removeButton->setEnabled(true);
     } else {
         d->installButton->setText(tr("Instalar"));
-        d->installButton->setEnabled(AbstractBackend::managesInstall());
+        d->installButton->setEnabled(d->anyBackend);
         d->removeButton->setEnabled(false);
     }
 }

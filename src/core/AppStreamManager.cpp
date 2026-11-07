@@ -4,7 +4,10 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QProcess>
+#include <QSet>
+#include <QStandardPaths>
 #include <QThreadPool>
 #include <QUrl>
 #include <QtConcurrent>
@@ -12,7 +15,9 @@
 #include <algorithm>
 
 #include <AppStreamQt/icon.h>
+#include <AppStreamQt/bundle.h>
 #include <AppStreamQt/image.h>
+#include <AppStreamQt/metadata.h>
 #include <AppStreamQt/pool.h>
 #include <AppStreamQt/screenshot.h>
 
@@ -91,13 +96,42 @@ int popularityScore(const AppInfo &info)
  *                   owned by the current user (~/.local/share/appstream).
  * @return The full list of desktop applications found in the pool.
  */
-static QList<AppInfo> loadPoolWorker(bool systemPool)
+static QList<AppInfo> loadPoolWorker(bool systemPool, bool excludeFlatpak = false)
 {
     QList<AppInfo> result;
 
     AppStream::Pool pool;
     pool.setLocale(QLocale::system().name());
-    pool.setLoadStdDataLocations(systemPool);
+
+    if (systemPool) {
+        // Standard locations include the OS catalog, Flatpak data and the
+        // per-user metadata installed for the current account.
+        pool.setLoadStdDataLocations(true);
+        if (excludeFlatpak)
+            pool.removeFlags(AppStream::Pool::FlagLoadFlatpak);
+    } else {
+        // Load only the current user's own metadata. Disabling the standard
+        // locations is required: the default load would duplicate the system
+        // pool and lose the ability to tell both scopes apart.
+        pool.setLoadStdDataLocations(false);
+        bool hasUserData = false;
+        const QString dataHome = QStandardPaths::writableLocation(
+            QStandardPaths::GenericDataLocation);
+        const QString metainfoDir = dataHome + QStringLiteral("/metainfo");
+        const QString appstreamDir = dataHome + QStringLiteral("/appstream");
+        if (QFileInfo::exists(metainfoDir)) {
+            pool.addExtraDataLocation(metainfoDir,
+                                      AppStream::Metadata::FormatStyleMetainfo);
+            hasUserData = true;
+        }
+        if (QFileInfo::exists(appstreamDir)) {
+            pool.addExtraDataLocation(appstreamDir,
+                                      AppStream::Metadata::FormatStyleCatalog);
+            hasUserData = true;
+        }
+        if (!hasUserData)
+            return result;
+    }
 
     if (!pool.load())
         return result;
@@ -119,8 +153,18 @@ static QList<AppInfo> loadPoolWorker(bool systemPool)
         info.name = cpt.name();
         info.summary = cpt.summary();
         info.description = cpt.description();
+        info.homepage = cpt.url(AppStream::Component::UrlKindHomepage).toString();
         info.categories = cpt.categories();
         info.packageNames = cpt.packageNames();
+        for (const AppStream::Bundle &bundle : cpt.bundles()) {
+            if (bundle.kind() == AppStream::Bundle::KindFlatpak) {
+                const QStringList parts = bundle.id().split(QLatin1Char('/'));
+                info.flatpakId = parts.size() >= 2 && parts.first() == QLatin1String("app")
+                    ? parts.at(1) : bundle.id();
+            } else if (bundle.kind() == AppStream::Bundle::KindSnap) {
+                info.snapId = bundle.id();
+            }
+        }
         info.origin = cpt.origin();
         info.iconName = cpt.id();
 
@@ -151,18 +195,20 @@ static QList<AppInfo> loadPoolWorker(bool systemPool)
             }
         }
 
+        // Resolve the real launcher once: the store uses it for icons,
+        // launching and for finding the package that owns the app.
+        info.desktopFile = findDesktopFile(info.id);
+
         // Native components frequently ship no usable AppStream icon (only a
         // theme name or a stale cache path). Fall back to the real Icon= of
         // the installed .desktop launcher so system apps still show artwork.
-        if (info.iconPath.isEmpty() && info.iconUrl.isEmpty()) {
-            const QString desktopFile = findDesktopFile(info.id);
-            if (!desktopFile.isEmpty()) {
-                const QString icon = desktopIcon(desktopFile);
-                if (icon.startsWith(QLatin1Char('/')))
-                    info.iconPath = icon;
-                else if (!icon.isEmpty())
-                    info.iconName = icon;
-            }
+        if (info.iconPath.isEmpty() && info.iconUrl.isEmpty()
+            && !info.desktopFile.isEmpty()) {
+            const QString icon = desktopIcon(info.desktopFile);
+            if (icon.startsWith(QLatin1Char('/')))
+                info.iconPath = icon;
+            else if (!icon.isEmpty())
+                info.iconName = icon;
         }
 
         // Collect up to 4 screenshot images for the detail view.
@@ -199,13 +245,196 @@ static QList<AppInfo> loadPoolWorker(bool systemPool)
 // ----------------------------------------------------------------------------
 // Private
 // ----------------------------------------------------------------------------
+namespace {
+
+struct PoolLoadResult
+{
+    QList<AppInfo> systemApps;
+    QList<AppInfo> userApps;
+};
+
+/**
+ * libappstream keeps non-thread-safe global state (profiling and GObject
+ * bookkeeping), so loading two pools in parallel from the global thread pool
+ * corrupts it and crashes inside as_pool_get_components(). Read both scopes
+ * one after the other on the same worker thread instead.
+ */
+PoolLoadResult loadAllPoolsWorker()
+{
+    PoolLoadResult loaded;
+    loaded.systemApps = loadPoolWorker(/*systemPool=*/true);
+    // AppStream can prefer a Flatpak component over the OS component with
+    // the same ID. Load the OS catalog separately as well so its package
+    // names survive when the combined view is assembled.
+    loaded.systemApps.append(loadPoolWorker(/*systemPool=*/true, /*excludeFlatpak=*/true));
+    loaded.userApps = loadPoolWorker(/*systemPool=*/false);
+    return loaded;
+}
+
+QList<AppInfo> mergedAppLists(const QList<AppInfo> &systemApps,
+                              const QList<AppInfo> &userApps)
+{
+    QList<AppInfo> result;
+    QHash<QString, int> indexById;
+    indexById.reserve(systemApps.size() + userApps.size());
+    QList<AppInfo> allApps = systemApps;
+    allApps.append(userApps);
+    for (const AppInfo &userApp : allApps) {
+        if (userApp.id.isEmpty())
+            continue;
+        QString key = userApp.id.toLower();
+        if (key.endsWith(QLatin1String(".desktop")))
+            key.chop(8);
+        const auto it = indexById.constFind(key);
+        if (it == indexById.cend()) {
+            indexById.insert(key, result.size());
+            result.append(userApp);
+            continue;
+        }
+
+        // Same component in both scopes: keep the richer system metadata but
+        // merge package names so installed detection works either way.
+        AppInfo &existing = result[it.value()];
+        for (const QString &pkg : userApp.packageNames) {
+            if (!existing.packageNames.contains(pkg))
+                existing.packageNames << pkg;
+        }
+        if (existing.desktopFile.isEmpty())
+            existing.desktopFile = userApp.desktopFile;
+        if (existing.flatpakId.isEmpty())
+            existing.flatpakId = userApp.flatpakId;
+        if (existing.snapId.isEmpty())
+            existing.snapId = userApp.snapId;
+        if (existing.homepage.isEmpty())
+            existing.homepage = userApp.homepage;
+    }
+
+    // Legacy distribution IDs often use a short desktop filename (e.g.
+    // blender.desktop), while Flatpak uses a reverse-DNS ID
+    // (org.blender.Blender). Match only when the short ID, final bundle-ID
+    // segment and display name all agree, and the native match is unique.
+    QHash<QString, QList<int>> nativeByShortId;
+    QHash<QString, QList<int>> nativeByProject;
+    QHash<QString, QList<int>> nativeByPackage;
+    QHash<QString, int> bundleProjectCounts;
+    auto projectKey = [](const AppInfo &app) {
+        QUrl url(app.homepage);
+        if (!url.isValid() || url.host().isEmpty() || app.name.trimmed().isEmpty())
+            return QString();
+        QString host = url.host().toLower();
+        if (host.startsWith(QLatin1String("www.")))
+            host.remove(0, 4);
+        QString path = url.path();
+        while (path.endsWith(QLatin1Char('/')))
+            path.chop(1);
+        return app.name.trimmed().toCaseFolded() + QLatin1Char('|')
+            + host + path;
+    };
+    auto normalizedToken = [](const QString &text) {
+        QString token;
+        for (const QChar c : text.toCaseFolded()) {
+            if (c.isLetterOrNumber())
+                token.append(c);
+        }
+        return token;
+    };
+    for (int i = 0; i < result.size(); ++i) {
+        const AppInfo &app = result.at(i);
+        QString id = app.id.toLower();
+        if (id.endsWith(QLatin1String(".desktop")))
+            id.chop(8);
+        if (!id.contains(QLatin1Char('.')) && !app.packageNames.isEmpty())
+            nativeByShortId[id].append(i);
+        for (const QString &package : app.packageNames) {
+            QString base = package.toLower();
+            for (const QString &suffix : {QStringLiteral("-gtk"), QStringLiteral("-qt"),
+                                          QStringLiteral("-qt6")}) {
+                if (base.endsWith(suffix)) {
+                    base.chop(suffix.size());
+                    break;
+                }
+            }
+            const QString token = normalizedToken(base);
+            if (token.size() >= 5 && !nativeByPackage[token].contains(i))
+                nativeByPackage[token].append(i);
+        }
+        const QString project = projectKey(app);
+        if (!project.isEmpty()) {
+            if (!app.packageNames.isEmpty())
+                nativeByProject[project].append(i);
+            else if (!app.flatpakId.isEmpty())
+                ++bundleProjectCounts[project];
+        }
+    }
+    QSet<int> merged;
+    for (int i = 0; i < result.size(); ++i) {
+        const AppInfo &bundle = result.at(i);
+        if (bundle.flatpakId.isEmpty() || !bundle.packageNames.isEmpty())
+            continue;
+        const QString shortId = bundle.flatpakId.section(QLatin1Char('.'), -1).toLower();
+        QList<int> matches = nativeByShortId.value(shortId);
+        if (matches.size() != 1) {
+            const QString project = projectKey(bundle);
+            if (!project.isEmpty() && bundleProjectCounts.value(project) == 1)
+                matches = nativeByProject.value(project);
+        }
+        if (matches.size() != 1) {
+            QSet<int> candidates;
+            for (const QString &part : bundle.flatpakId.split(QLatin1Char('.'))) {
+                const QString token = normalizedToken(part);
+                if (token.size() < 5)
+                    continue;
+                for (int candidate : nativeByPackage.value(token)) {
+                    if (result.at(candidate).name.trimmed().compare(
+                            bundle.name.trimmed(), Qt::CaseInsensitive) == 0)
+                        candidates.insert(candidate);
+                }
+            }
+            matches = candidates.values();
+        }
+        if (matches.size() != 1 || matches.first() == i)
+            continue;
+        AppInfo &native = result[matches.first()];
+        if (native.name.trimmed().compare(bundle.name.trimmed(), Qt::CaseInsensitive) != 0
+            || (!projectKey(native).isEmpty() && !projectKey(bundle).isEmpty()
+                && projectKey(native) != projectKey(bundle))
+            || (!native.flatpakId.isEmpty() && native.flatpakId != bundle.flatpakId))
+            continue;
+        native.flatpakId = bundle.flatpakId;
+        if (native.snapId.isEmpty())
+            native.snapId = bundle.snapId;
+        if (native.description.isEmpty())
+            native.description = bundle.description;
+        if (native.iconUrl.isEmpty() && native.iconPath.isEmpty())
+            native.iconUrl = bundle.iconUrl;
+        if (native.screenshotUrls.isEmpty())
+            native.screenshotUrls = bundle.screenshotUrls;
+        merged.insert(i);
+    }
+    QList<AppInfo> unique;
+    unique.reserve(result.size() - merged.size());
+    for (int i = 0; i < result.size(); ++i) {
+        if (!merged.contains(i))
+            unique.append(result.at(i));
+    }
+    return unique;
+}
+} // namespace
+
 class AppStreamManager::Private
 {
 public:
     QList<AppInfo> apps;
     QList<AppInfo> userApps;
     bool isBusy = false;
+    bool reloadQueued = false;
     bool refreshQueued = false;
+
+    bool refreshRunning = false;
+    bool refreshHadFailure = false;
+    int refreshStep = 0;
+    QStringList refreshPrograms;
+    QList<QStringList> refreshArguments;
 };
 
 // ----------------------------------------------------------------------------
@@ -232,9 +461,8 @@ QList<AppInfo> AppStreamManager::userApps() const
 
 void AppStreamManager::startLoading()
 {
-    if (d->isBusy)
+    if (d->isBusy || d->refreshRunning)
         return;
-    d->isBusy = true;
 
     // Decide whether a background cache refresh is warranted. We deliberately
     // do NOT block the GUI here; the refresh (appstreamcli refresh --source=os)
@@ -266,85 +494,173 @@ void AppStreamManager::startLoading()
         needsRefresh = !anyFresh;
     }
 
-    // Cache is fresh? Load directly, otherwise kick a background refresh
-    // first and load the (possibly stale) pool right away for instant UI.
     // Always tell the UI we are loading so the busy indicator shows up even
-    // when the cache is warm.
+    // when the cache is warm. System and user pools are loaded together.
     emit refreshStarted();
-    loadPoolAsync(/*systemPool=*/true);
+    loadAllPools();
 
     if (needsRefresh) {
-        // fire-and-forget index refresh; result is not strictly required for
-        // a responsive store view, but the user can re-trigger it manually.
-        runCacheRefresh();
+        // A TTL-triggered refresh must not prompt for root credentials; it
+        // only regenerates the AppStream cache from already-available data.
+        runCacheRefresh(/*includeSystemIndex=*/false);
     }
 }
 
-void AppStreamManager::requestCacheRefresh()
+void AppStreamManager::requestCacheRefresh(bool includeSystemIndex)
 {
-    // If a load is already running, remember the request and run a fresh
-    // load as soon as the current one finishes instead of silently ignoring
-    // the click (otherwise the busy indicator never appears).
-    if (d->isBusy) {
+    // If a load or refresh is already running, remember the request and run a
+    // fresh refresh as soon as the current work finishes instead of silently
+    // ignoring the click (otherwise the busy indicator never appears).
+    if (d->isBusy || d->refreshRunning) {
         d->refreshQueued = true;
         return;
     }
     emit refreshStarted();
-    runCacheRefresh();
+    runCacheRefresh(includeSystemIndex);
 }
 
-void AppStreamManager::runCacheRefresh()
+void AppStreamManager::runCacheRefresh(bool includeSystemIndex)
 {
+    if (d->refreshRunning) {
+        d->refreshQueued = true;
+        return;
+    }
+
+    d->refreshRunning = true;
+    d->refreshHadFailure = false;
+    d->refreshStep = 0;
+    d->refreshPrograms.clear();
+    d->refreshArguments.clear();
+
+    const bool hasPkexec = QFileInfo::exists(QStringLiteral("/usr/bin/pkexec"));
+
+    // Refresh the real package index first, so a manual "Refrescar" click
+    // actually discovers new AppStream metadata published by the distro.
+    if (includeSystemIndex && hasPkexec) {
+        if (QFileInfo::exists(QStringLiteral("/usr/bin/apt-get"))) {
+            d->refreshPrograms << QStringLiteral("pkexec");
+            d->refreshArguments << (QStringList()
+                                    << QStringLiteral("apt-get")
+                                    << QStringLiteral("update"));
+        } else if (QFileInfo::exists(QStringLiteral("/usr/bin/dnf"))) {
+            d->refreshPrograms << QStringLiteral("pkexec");
+            d->refreshArguments << (QStringList()
+                                    << QStringLiteral("dnf")
+                                    << QStringLiteral("makecache"));
+        } else if (QFileInfo::exists(QStringLiteral("/usr/bin/pacman"))) {
+            d->refreshPrograms << QStringLiteral("pkexec");
+            d->refreshArguments << (QStringList()
+                                    << QStringLiteral("pacman")
+                                    << QStringLiteral("-Sy")
+                                    << QStringLiteral("--noconfirm"));
+        }
+    }
+
+    // Flatpak keeps its own AppStream catalog; refresh it when available.
+    if (QFileInfo::exists(QStringLiteral("/usr/bin/flatpak"))) {
+        d->refreshPrograms << QStringLiteral("flatpak");
+        d->refreshArguments << (QStringList()
+                                << QStringLiteral("update")
+                                << QStringLiteral("--appstream"));
+    }
+
     // "appstreamcli refresh-index" no longer exists in AppStream 1.x.
     // "refresh --source=os" regenerates the OS metadata cache in exactly the
     // same way the apt post-invoke hook does, so the pool and this store see
     // identical data afterwards.
-    QProcess *refresh = new QProcess(this);
-    connect(refresh, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-            this, [this, refresh](int code, QProcess::ExitStatus) {
-                refresh->deleteLater();
-                if (code == 0) {
-                    emit refreshCacheSucceeded();
-                    // The refreshed cache may hold newer components than the
-                    // pool we already loaded; reflect that in the UI.
-                    loadPoolAsync(/*systemPool=*/true);
-                } else {
-                    emit refreshCacheFailed();
-                }
-            });
-    connect(refresh, &QProcess::errorOccurred, this, [this, refresh] {
-        refresh->deleteLater();
-        emit refreshCacheFailed();
-    });
-    refresh->start(QStringLiteral("appstreamcli"),
-                   QStringList() << QStringLiteral("refresh")
-                                 << QStringLiteral("--source=os"));
+    d->refreshPrograms << QStringLiteral("appstreamcli");
+    d->refreshArguments << (QStringList()
+                            << QStringLiteral("refresh")
+                            << QStringLiteral("--source=os"));
+
+    runNextRefreshStep();
 }
 
-void AppStreamManager::loadPoolAsync(bool systemPool)
+void AppStreamManager::runNextRefreshStep()
 {
-    using Watcher = QFutureWatcher<QList<AppInfo>>;
+    if (d->refreshStep >= d->refreshPrograms.size()) {
+        d->refreshRunning = false;
+        if (d->refreshHadFailure)
+            emit refreshCacheFailed();
+        else
+            emit refreshCacheSucceeded();
+
+        // The refreshed caches may hold newer components than the pool we
+        // already loaded; reflect that in the UI.
+        loadAllPools();
+
+        if (d->refreshQueued) {
+            d->refreshQueued = false;
+            emit refreshStarted();
+            runCacheRefresh(/*includeSystemIndex=*/true);
+        }
+        return;
+    }
+
+    const int index = d->refreshStep;
+    const QString program = d->refreshPrograms.at(index);
+    const QStringList args = d->refreshArguments.at(index);
+
+    QProcess *step = new QProcess(this);
+    connect(step, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+            this, [this, step](int code, QProcess::ExitStatus) {
+                step->deleteLater();
+                if (code != 0)
+                    d->refreshHadFailure = true;
+                ++d->refreshStep;
+                runNextRefreshStep();
+            });
+    connect(step, &QProcess::errorOccurred, this,
+            [this, step](QProcess::ProcessError error) {
+                if (error != QProcess::FailedToStart)
+                    return;
+                step->deleteLater();
+                d->refreshHadFailure = true;
+                ++d->refreshStep;
+                runNextRefreshStep();
+            });
+    step->start(program, args);
+}
+
+void AppStreamManager::loadAllPools()
+{
+    // Never run two pool loads at the same time: libappstream shares global
+    // state between Pool instances. Queue a reload instead and let the
+    // in-flight worker finish first.
+    if (d->isBusy) {
+        d->reloadQueued = true;
+        return;
+    }
+
+    using Watcher = QFutureWatcher<PoolLoadResult>;
     d->isBusy = true;
     Watcher *watcher = new Watcher(this);
-    connect(watcher, &QFutureWatcherBase::finished, this,
-            [this, watcher, systemPool] {
-                const QList<AppInfo> loaded = watcher->result();
-                watcher->deleteLater();
-                if (systemPool)
-                    d->apps = loaded;
-                else
-                    d->userApps = loaded;
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher] {
+        const PoolLoadResult loaded = watcher->result();
+        watcher->deleteLater();
 
-                if (d->refreshQueued) {
-                    d->refreshQueued = false;
-                    loadPoolAsync(systemPool);
-                    return;
-                }
-                d->isBusy = false;
-                emit dataReady(loaded);
-            });
+        d->apps = loaded.systemApps;
+        d->userApps = loaded.userApps;
+        d->isBusy = false;
 
-    watcher->setFuture(QtConcurrent::run(&loadPoolWorker, systemPool));
+        // A refresh finished while this load was running: its results are
+        // newer, so read the pools again instead of publishing stale data.
+        if (d->reloadQueued) {
+            d->reloadQueued = false;
+            loadAllPools();
+            return;
+        }
+
+        emit dataReady(mergedAppLists(d->apps, d->userApps));
+
+        if (d->refreshQueued && !d->refreshRunning) {
+            d->refreshQueued = false;
+            emit refreshStarted();
+            runCacheRefresh(/*includeSystemIndex=*/true);
+        }
+    });
+
+    watcher->setFuture(QtConcurrent::run(&loadAllPoolsWorker));
 }
 
 #include "moc_AppStreamManager.cpp"

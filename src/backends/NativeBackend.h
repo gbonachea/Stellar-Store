@@ -44,6 +44,12 @@ public:
      */
     void installLocalFile(const QString &filePath);
 
+    /**
+     * Name of the native package that owns @p filePath (best effort). Empty
+     * when the file is not owned by the distribution package manager.
+     */
+    QString packageOwningFile(const QString &filePath) const;
+
 private:
     enum class Tool { Apt, Dnf, Pacman, Unknown };
     Tool detectTool() const;

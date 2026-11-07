@@ -29,11 +29,16 @@ public slots:
     void loadFromConfig();
     void saveToConfig();
 
+signals:
+    void backendSettingsChanged();
+
 protected:
     void showEvent(QShowEvent *event) override;
 
 private:
     void refreshIconCacheInfo();
+    void setBackendEnabled(bool flatpak, bool enabled);
+    void configureFlatpak(bool enabled);
 
     class Private;
     std::unique_ptr<Private> d;

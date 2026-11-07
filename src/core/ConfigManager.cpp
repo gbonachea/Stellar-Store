@@ -3,7 +3,9 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QSettings>
+#include <QUrl>
 
 class ConfigManager::Private
 {
@@ -91,36 +93,107 @@ void ConfigManager::setSnapEnabled(bool enabled)
     d->settings.sync();
 }
 
+QString ConfigManager::normalizeGithubRepository(const QString &input)
+{
+    QString ref = input.trimmed();
+    if (ref.isEmpty())
+        return QString();
+
+    // Accept full URLs: https://github.com/owner/name(.git)(/)
+    if (ref.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
+        || ref.startsWith(QLatin1String("https://"), Qt::CaseInsensitive)) {
+        const QUrl url(ref);
+        const QString host = url.host().toLower();
+        if (host != QLatin1String("github.com") && host != QLatin1String("www.github.com"))
+            return QString();
+        ref = url.path();
+    }
+
+    // Strip query/fragment leftovers and surrounding slashes.
+    const int queryPos = ref.indexOf(QLatin1Char('?'));
+    if (queryPos >= 0)
+        ref.truncate(queryPos);
+    const int fragmentPos = ref.indexOf(QLatin1Char('#'));
+    if (fragmentPos >= 0)
+        ref.truncate(fragmentPos);
+
+    while (ref.startsWith(QLatin1Char('/')))
+        ref.remove(0, 1);
+    while (ref.endsWith(QLatin1Char('/')))
+        ref.chop(1);
+    if (ref.endsWith(QLatin1String(".git"), Qt::CaseInsensitive))
+        ref.chop(4);
+
+    const QStringList parts = ref.split(QLatin1Char('/'));
+    if (parts.size() != 2)
+        return QString();
+    if (parts.at(0).isEmpty() || parts.at(1).isEmpty())
+        return QString();
+
+    // GitHub owner/repo names are limited to these characters.
+    static const QRegularExpression valid(
+        QStringLiteral("^[A-Za-z0-9_.-]+$"));
+    if (!valid.match(parts.at(0)).hasMatch() || !valid.match(parts.at(1)).hasMatch())
+        return QString();
+
+    return parts.at(0) + QLatin1Char('/') + parts.at(1);
+}
+
 QStringList ConfigManager::githubRepositories() const
 {
-    return d->settings.value(QStringLiteral("github_repositories")).toStringList();
+    const QStringList stored =
+        d->settings.value(QStringLiteral("github_repositories")).toStringList();
+
+    // Settings written by older releases may contain unnormalized values.
+    QStringList cleaned;
+    for (const QString &r : stored) {
+        const QString normalized = normalizeGithubRepository(r);
+        if (!normalized.isEmpty() && !cleaned.contains(normalized))
+            cleaned << normalized;
+    }
+    return cleaned;
 }
 
 void ConfigManager::setGithubRepositories(const QStringList &repos)
 {
     QStringList cleaned;
     for (const QString &r : repos) {
-        const auto parts = r.split(QLatin1Char('/'));
-        if (parts.size() == 2 && !parts.at(0).isEmpty() && !parts.at(1).isEmpty())
-            cleaned << r;
+        const QString normalized = normalizeGithubRepository(r);
+        if (!normalized.isEmpty() && !cleaned.contains(normalized))
+            cleaned << normalized;
     }
-    cleaned.removeDuplicates();
-    d->settings.setValue(QStringLiteral("github_repositories"), cleaned);
+    if (cleaned == githubRepositories())
+        return;
+    if (cleaned.isEmpty())
+        d->settings.remove(QStringLiteral("github_repositories"));
+    else
+        d->settings.setValue(QStringLiteral("github_repositories"), cleaned);
     d->settings.sync();
+    Q_EMIT githubRepositoriesChanged();
 }
 
-void ConfigManager::addGithubRepository(const QString &repo)
+bool ConfigManager::addGithubRepository(const QString &repo)
 {
+    const QString normalized = normalizeGithubRepository(repo);
+    if (normalized.isEmpty())
+        return false;
+
     auto repos = githubRepositories();
-    if (!repos.contains(repo))
-        repos << repo;
+    if (repos.contains(normalized))
+        return true;
+    repos << normalized;
     setGithubRepositories(repos);
+    return true;
 }
 
 void ConfigManager::removeGithubRepository(const QString &repo)
 {
+    const QString normalized = normalizeGithubRepository(repo);
+    if (normalized.isEmpty())
+        return;
+
     auto repos = githubRepositories();
-    if (repos.removeAll(repo) > 0)
+    if (repos.removeAll(normalized) > 0)
         setGithubRepositories(repos);
 }
 

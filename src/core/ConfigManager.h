@@ -51,12 +51,23 @@ public:
 
     // --- GitHub repositories ---------------------------------------------
     /**
+     * Normalize a user supplied repository reference into "owner/name".
+     *
+     * Accepts "owner/name", full https://github.com/owner/name URLs,
+     * trailing slashes and the ".git" suffix. Returns an empty string when
+     * the reference cannot be understood.
+     */
+    static QString normalizeGithubRepository(const QString &input);
+
+    /**
      * List of repositories in "owner/name" form that are polled for the
      * latest releases on the Home screen and in the Catalog.
      */
     QStringList githubRepositories() const;
     void setGithubRepositories(const QStringList &repos);
-    void addGithubRepository(const QString &repo);
+
+    /** Add a repository. Returns false when @p repo is not a valid reference. */
+    bool addGithubRepository(const QString &repo);
     void removeGithubRepository(const QString &repo);
 
     // --- runtime auto-detection flags (not user-edited) ------------------
@@ -81,6 +92,10 @@ public:
     // --- persistence -----------------------------------------------------
     /** Flush all pending changes to disk. */
     void flush();
+
+signals:
+    /** Emitted whenever the configured GitHub repository list changes. */
+    void githubRepositoriesChanged();
 
 private:
     ConfigManager(QObject *parent = nullptr);
